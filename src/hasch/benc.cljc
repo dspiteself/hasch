@@ -74,18 +74,32 @@
 
 (defn ^bytes encode-safe [^bytes a md-create-fn]
   (if (< (count a) split-size)
-    (let [len (long (alength a))
-          ea (byte-array len)]
-      (loop [i 0]
-        (when-not (= i len)
-          (let [e (aget a i)]
-            (when (and (> e (byte 0))
-                       (< e (byte 30)))
-              (aset ea i (byte 1))))
-          (recur (inc i))))
-      #?(:clj (let [out (ByteArrayOutputStream.)]
-                (.write out a)
-                (.write out ea)
-                (.toByteArray out))
-         :cljs (.concat a ea)))
+    #?(:clj
+       ;; Build the `a ++ escape-markers` array in a single allocation:
+       ;; the low half is a copy of `a`, the (zero-initialised) high half gets a
+       ;; 1 wherever a[i] is a control-ish byte (0 < a[i] < 30). This is
+       ;; byte-identical to the previous ByteArrayOutputStream(a, ea) output but
+       ;; avoids the extra `ea` array, the stream's growable buffer and its copy.
+       (let [len (long (alength a))
+             r (byte-array (* 2 len))]
+         (System/arraycopy a 0 r 0 len)
+         (loop [i 0]
+           (when-not (= i len)
+             (let [e (aget a i)]
+               (when (and (> e (byte 0))
+                          (< e (byte 30)))
+                 (aset r (+ len i) (byte 1))))
+             (recur (inc i))))
+         r)
+       :cljs
+       (let [len (long (alength a))
+             ea (byte-array len)]
+         (loop [i 0]
+           (when-not (= i len)
+             (let [e (aget a i)]
+               (when (and (> e (byte 0))
+                          (< e (byte 30)))
+                 (aset ea i (byte 1))))
+             (recur (inc i))))
+         (.concat a ea)))
     (digest a md-create-fn)))

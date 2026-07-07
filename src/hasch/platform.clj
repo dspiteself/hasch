@@ -8,6 +8,7 @@
                                 digest coerce-seq xor-hashes encode-safe]])
   (:import java.io.ByteArrayOutputStream
            java.nio.ByteBuffer
+           java.nio.charset.StandardCharsets
            java.security.MessageDigest))
 
 (set! *warn-on-reflection* true)
@@ -50,13 +51,17 @@ Our hash version is coded in first 2 bits."
                          (bit-clear 62)))))
 
 (defn ^bytes encode [^Byte magic ^bytes a]
-  (let [out (ByteArrayOutputStream.)]
-    (.write out (byte-array 1 magic))
-    (.write out a)
-    (.toByteArray out)))
+  ;; Prepend the 1-byte type magic in a single allocation (magic ++ a) instead
+  ;; of routing through a ByteArrayOutputStream (which allocated a 1-byte array,
+  ;; a growable buffer and a final copy). Byte-identical output.
+  (let [len (alength a)
+        r (byte-array (inc len))]
+    (aset r 0 (byte magic))
+    (System/arraycopy a 0 r 1 len)
+    r))
 
 (defn- ^bytes str->utf8 [x]
-  (-> x str (.getBytes "UTF-8")))
+  (.getBytes ^String (str x) StandardCharsets/UTF_8))
 
 (extend-protocol PHashCoercion
   java.lang.Boolean
@@ -74,39 +79,39 @@ Our hash version is coded in first 2 bits."
 
   java.lang.Integer
   (-coerce [this md-create-fn write-handlers]
-    (encode (:number magics) (.getBytes (.toString this) "UTF-8")))
+    (encode (:number magics) (.getBytes (.toString this) StandardCharsets/UTF_8)))
 
   java.lang.Long
   (-coerce [this md-create-fn write-handlers]
-    (encode (:number magics) (.getBytes (.toString this) "UTF-8")))
+    (encode (:number magics) (.getBytes (.toString this) StandardCharsets/UTF_8)))
 
   java.math.BigInteger
   (-coerce [this md-create-fn write-handlers]
-    (encode (:number magics) (.getBytes (.toString this) "UTF-8")))
+    (encode (:number magics) (.getBytes (.toString this) StandardCharsets/UTF_8)))
 
   java.lang.Float
   (-coerce [this md-create-fn write-handlers]
-    (encode (:number magics) (.getBytes (.toString this) "UTF-8")))
+    (encode (:number magics) (.getBytes (.toString this) StandardCharsets/UTF_8)))
 
   java.lang.Double
   (-coerce [this md-create-fn write-handlers]
-    (encode (:number magics) (.getBytes (.toString this) "UTF-8")))
+    (encode (:number magics) (.getBytes (.toString this) StandardCharsets/UTF_8)))
 
   java.math.BigDecimal
   (-coerce [this md-create-fn write-handlers]
-    (encode (:number magics) (.getBytes (.toString this) "UTF-8")))
+    (encode (:number magics) (.getBytes (.toString this) StandardCharsets/UTF_8)))
 
   clojure.lang.BigInt
   (-coerce [this md-create-fn write-handlers]
-    (encode (:number magics) (.getBytes (.toString this) "UTF-8")))
+    (encode (:number magics) (.getBytes (.toString this) StandardCharsets/UTF_8)))
 
   java.util.UUID
   (-coerce [this md-create-fn write-handlers]
-    (encode (:uuid magics) (.getBytes (.toString this) "UTF-8")))
+    (encode (:uuid magics) (.getBytes (.toString this) StandardCharsets/UTF_8)))
 
   java.util.Date
   (-coerce [this md-create-fn write-handlers]
-    (encode (:inst magics) (.getBytes (.toString ^java.lang.Long (.getTime this)) "UTF-8")))
+    (encode (:inst magics) (.getBytes (.toString ^java.lang.Long (.getTime this)) StandardCharsets/UTF_8)))
 
   nil
   (-coerce [this md-create-fn write-handlers]
