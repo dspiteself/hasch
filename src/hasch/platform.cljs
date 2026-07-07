@@ -84,6 +84,12 @@ Our hash version is coded in first 2 bits."
                       "-" (apply str (drop 20 s)))))
         uuid)))
 
+;; In ClojureScript the digest already yields unsigned 0-255 values, so the raw
+;; digest and the `edn-hash` "make unsigned" output are the same shape: the
+;; JVM's byte-array round-trip does not exist here. `uuid5-bytes` is therefore
+;; just `uuid5`, keeping `hasch.core/uuid` cross-platform.
+(def uuid5-bytes uuid5)
+
 (defn sha512-message-digest []
   (goog.crypt.Sha512.))
 

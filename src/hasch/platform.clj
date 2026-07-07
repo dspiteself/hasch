@@ -34,11 +34,16 @@
 (defn ^MessageDigest md5-message-digest []
   (MessageDigest/getInstance "md5"))
 
-(defn uuid5
-  "Generates a UUID version 5 from a sha-1 hash byte sequence.
-Our hash version is coded in first 2 bits."
-  [sha-hash]
-  (let [bb (ByteBuffer/wrap (byte-array sha-hash))
+(defn uuid5-bytes
+  "Like `uuid5` but takes the raw (signed) SHA digest byte-array directly.
+
+  `uuid5` accepts the unsigned 0-255 sequence produced by `edn-hash` and rebuilds
+  a byte-array from it; that round-trip is a no-op — `(byte-array unsigned-seq)`
+  reproduces the original signed digest bytes exactly. Callers that already hold
+  the raw digest array (e.g. `hasch.core/uuid`) use this to skip both the lazy
+  unsigned seq (~7.8 KB/op) and the byte-array rebuild."
+  [^bytes sha-hash]
+  (let [bb (ByteBuffer/wrap sha-hash)
         high (.getLong bb)
         low (.getLong bb)]
     (java.util.UUID. (-> high
@@ -49,6 +54,12 @@ Our hash version is coded in first 2 bits."
                      (-> low
                          (bit-set 63)
                          (bit-clear 62)))))
+
+(defn uuid5
+  "Generates a UUID version 5 from a sha-1 hash byte sequence.
+Our hash version is coded in first 2 bits."
+  [sha-hash]
+  (uuid5-bytes (byte-array sha-hash)))
 
 (defn ^bytes encode [^Byte magic ^bytes a]
   ;; Prepend the 1-byte type magic in a single allocation (magic ++ a) instead
