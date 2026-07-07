@@ -99,5 +99,8 @@
    by following `HashRef`s embedded in other stored values — no original value required."
   ([hash-ref] (ref->uuid hash-ref platform/sha512-message-digest))
   ([hash-ref md-create-fn]
-   (uuid5 (map #(if (neg? %) (+ % 256) %)   ; make unsigned, as in edn-hash
-               (digest (:hash-bytes hash-ref) md-create-fn)))))
+   ;; Same raw-digest fast path as `uuid`: `uuid5` would rebuild a byte-array from
+   ;; the unsigned lazy seq, and `(byte-array (map make-unsigned raw)) == raw`, so
+   ;; feed the raw digest straight to `uuid5-bytes`. Identical UUID, no unsigned
+   ;; seq (~7.8 KB/op) and no array rebuild.
+   (platform/uuid5-bytes (digest (:hash-bytes hash-ref) md-create-fn))))
