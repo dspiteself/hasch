@@ -74,6 +74,80 @@ Our hash version is coded in first 2 bits."
 (defn- ^bytes str->utf8 [x]
   (.getBytes ^String (str x) StandardCharsets/UTF_8))
 
+;; --- fused map hashing ------------------------------------------------------
+;;
+;; A map hashes as XOR over `(encode :vector (sha512 (coerce k) ++ (coerce v)))`
+;; per entry, truncated to 32 bytes. The naive form materialises, per entry, a
+;; MapEntry + seq node (from `(seq m)`/`map`), the 65-byte encoded array, and a
+;; lazy-seq cell — all only to be XOR-folded and discarded. Here we fold each
+;; entry directly into the 32-byte accumulator: byte 0 XORs the :vector magic,
+;; bytes 1..31 XOR digest[0..30]. Entries are visited via `reduce-kv`
+;; (IKVReduce: the map's internal reduce — no seq, no MapEntry allocation),
+;; falling back to a seq walk for exotic map types. XOR is commutative, so
+;; visit order is irrelevant; output is bit-identical to
+;; `(xor-hashes (map -coerce (seq m)))`, including `(byte-array 0)` for {}.
+
+;; NOTE on hints in this section: `(defn ^bytes f ...)` return-type tags are a
+;; trap — `def` EVALUATES metadata, so the var's :tag becomes the
+;; clojure.core/bytes FUNCTION object, and any call site that consults the
+;; expression's type (alength/aget on the result) fails to compile. So these
+;; helpers carry no return tags; all array interop happens on ^bytes PARAMS.
+
+(defn- map-entry-digest
+  "digest of (-coerce k) ++ (-coerce v): the same bytes `coerce-seq` produces
+   for the entry viewed as the vector [k v], without allocating the entry."
+  [k v md-create-fn write-handlers]
+  (let [^MessageDigest md (md-create-fn)]
+    (.update md ^bytes (-coerce k md-create-fn write-handlers))
+    (.update md ^bytes (-coerce v md-create-fn write-handlers))
+    (.digest md)))
+
+(defn- new-acc
+  "XOR accumulator sized like xor-hashes' min(count(first-hash), 32), where the
+   entry hash is `prefix-len` magic bytes followed by digest `d`:
+   SHA-512 map entries -> 32, MD5 map entries -> 17, MD5 set elements -> 16."
+  [^bytes d ^long prefix-len]
+  (byte-array (min (+ prefix-len (alength d)) 32)))
+
+(defn- xor-map-entry! [^bytes acc ^bytes d]
+  ;; entry-hash = [:vector-magic] ++ d, so byte 0 XORs the magic and byte i
+  ;; XORs d[i-1] — without materialising the encoded entry array.
+  (let [len (alength acc)]
+    (aset acc 0 (byte (bit-xor (aget acc 0) 9))) ; 9 = (:vector magics)
+    (loop [i 1]
+      (when (< i len)
+        (aset acc i (byte (bit-xor (aget acc i) (aget d (unchecked-dec i)))))
+        (recur (unchecked-inc i))))))
+
+(defn- xor-map-hashes
+  "Fused replacement for (xor-hashes (map -coerce (seq m))): each entry's digest
+   folds straight into the accumulator — no MapEntry/seq-node/lazy-seq cells and
+   no per-entry 65-byte encoded arrays. Entries are visited via `reduce-kv`
+   (IKVReduce internal reduce) with a seq-walk fallback for map types without it
+   (e.g. struct-map). XOR is commutative so visit order is irrelevant. The
+   accumulator is allocated lazily off the first digest ({} yields
+   (byte-array 0), as before)."
+  [m md-create-fn write-handlers]
+  (let [holder (object-array 1)
+        fold! (fn [k v]
+                (let [d (map-entry-digest k v md-create-fn write-handlers)
+                      acc (aget holder 0)
+                      acc (if (nil? acc)
+                            (let [a (new-acc d 1)] (aset holder 0 a) a)
+                            acc)]
+                  (xor-map-entry! acc d)))]
+    (if (instance? clojure.lang.IKVReduce m)
+      (reduce-kv (fn [_ k v] (fold! k v) nil) nil m)
+      (loop [s (seq m)]
+        (when s
+          ;; IMapEntry, not MapEntry: sorted-map seqs yield tree-node entries
+          ;; that implement the former but are not instances of the latter.
+          (let [^clojure.lang.IMapEntry e (first s)]
+            (fold! (.key e) (.val e)))
+          (recur (next s)))))
+    (let [acc (aget holder 0)]
+      (if (nil? acc) (byte-array 0) acc))))
+
 (extend-protocol PHashCoercion
   java.lang.Boolean
   (-coerce [this md-create-fn write-handlers]
@@ -159,7 +233,7 @@ Our hash version is coded in first 2 bits."
     (if (record? this) ;; BUG somehow records can also trigger the map sometimes (?)
       (let [{:keys [tag value]} (ib/incognito-writer write-handlers this)]
         (encode (:literal magics) (coerce-seq [tag value] md-create-fn write-handlers)))
-      (encode (:map magics) (xor-hashes (map #(-coerce % md-create-fn write-handlers) (seq this))))))
+      (encode (:map magics) (xor-map-hashes this md-create-fn write-handlers))))
 
   clojure.lang.IPersistentSet
   (-coerce [this md-create-fn write-handlers]
