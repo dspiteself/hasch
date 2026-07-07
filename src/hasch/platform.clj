@@ -119,6 +119,14 @@ Our hash version is coded in first 2 bits."
         (aset acc i (byte (bit-xor (aget acc i) (aget d (unchecked-dec i)))))
         (recur (unchecked-inc i))))))
 
+(defn- xor-set-elem! [^bytes acc ^bytes d]
+  ;; set element hashes carry no magic prefix: byte i XORs d[i].
+  (let [len (alength acc)]
+    (loop [i 0]
+      (when (< i len)
+        (aset acc i (byte (bit-xor (aget acc i) (aget d i))))
+        (recur (unchecked-inc i))))))
+
 (defn- xor-map-hashes
   "Fused replacement for (xor-hashes (map -coerce (seq m))): each entry's digest
    folds straight into the accumulator — no MapEntry/seq-node/lazy-seq cells and
@@ -145,6 +153,29 @@ Our hash version is coded in first 2 bits."
           (let [^clojure.lang.IMapEntry e (first s)]
             (fold! (.key e) (.val e)))
           (recur (next s)))))
+    (let [acc (aget holder 0)]
+      (if (nil? acc) (byte-array 0) acc))))
+
+(defn- xor-set-hashes
+  "Fused analogue of (xor-hashes (map #(digest (-coerce %) ...) (seq s))).
+   Sets are not IKVReduce/IReduceInit, but `reduce` walks them via their
+   internal iterator (CollReduce's Iterable/iter-reduce) — no seq nodes."
+  [s md-create-fn write-handlers]
+  (let [holder (object-array 1)]
+    (reduce (fn [_ elem]
+              ;; ^bytes on the EXPRESSION, not the symbol: `digest`'s defn
+              ;; carries an evaluated ^bytes var :tag (the clojure.core/bytes
+              ;; fn object); a symbol hint would make the compiler consult it
+              ;; and fail, while a form hint overrides it.
+              (let [d ^bytes (digest (-coerce elem md-create-fn write-handlers)
+                                     md-create-fn)
+                    acc (aget holder 0)
+                    acc (if (nil? acc)
+                          (let [a (new-acc d 0)] (aset holder 0 a) a)
+                          acc)]
+                (xor-set-elem! acc d)
+                nil))
+            nil s)
     (let [acc (aget holder 0)]
       (if (nil? acc) (byte-array 0) acc))))
 
@@ -237,9 +268,7 @@ Our hash version is coded in first 2 bits."
 
   clojure.lang.IPersistentSet
   (-coerce [this md-create-fn write-handlers]
-    (encode (:set magics) (xor-hashes (map #(digest (-coerce % md-create-fn write-handlers)
-                                                    md-create-fn)
-                                           (seq this)))))
+    (encode (:set magics) (xor-set-hashes this md-create-fn write-handlers)))
 
   ;; not ideal, InputStream might be more flexible
   ;; file is used due to length knowledge
