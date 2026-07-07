@@ -13,8 +13,10 @@
                                io.replikativ/hasch                  {:local/root "."}}
                   :main-opts ["-m" "kaocha.runner"]
                   :extra-paths ["test"]}
-           :bench {:extra-deps {criterium/criterium {:mvn/version "0.4.6"}}
-                   :jvm-opts ["-Xmx2g"]}
+           :bench {:extra-paths ["dev"]
+                   :extra-deps {criterium/criterium {:mvn/version "0.4.6"}}
+                   :jvm-opts ["-Xmx2g"]
+                   :main-opts ["-m" "bench"]}
            :build  {:deps       {io.github.clojure/tools.build {:mvn/version "0.9.3"}
                                  slipset/deps-deploy           {:mvn/version "0.2.0"}
                                  borkdude/gh-release-artifact  {:git/url "https://github.com/borkdude/gh-release-artifact"
