@@ -1,7 +1,10 @@
 (ns hasch.benc
   "Binary encoding of EDN values."
   #?@(:clj [(:import java.security.MessageDigest
-                     java.io.ByteArrayOutputStream)]))
+                     java.io.ByteArrayOutputStream
+                     java.util.ArrayDeque
+                     java.util.IdentityHashMap
+                     java.util.function.Supplier)]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -40,23 +43,73 @@
 
 #?(:cljs (defn- byte-array [len] (into-array (repeat len 0))))
 
+;; --- MessageDigest reuse (JVM) ---------------------------------------------
+;;
+;; The hot path allocates one `MessageDigest` per collection / seq / map-entry
+;; (4 per Coding, 10 per CodeableConcept). Each `MessageDigest/getInstance`
+;; both allocates a ~384 byte stateful object AND does a synchronized provider
+;; lookup. `MessageDigest.digest()` leaves the instance reset (ready to reuse),
+;; so we keep a per-thread free-list keyed by `md-create-fn` identity and hand
+;; instances back after each digest. Nested digests are live simultaneously
+;; (e.g. a vector's seq-md while its elements hash), but each borrows a distinct
+;; instance and only returns it AFTER `.digest`, so no instance is ever aliased
+;; across two live computations. On exception an instance is simply dropped
+;; (never returned) — the pool shrinks, hashes stay correct. Keyed by
+;; `md-create-fn` so the default SHA-512 and a caller's MD5 never mix.
+;;
+;; ClojureScript has no threads; there `borrow-md` just calls the factory and
+;; `release-md` is a no-op, i.e. behaviour is identical to the original code.
+#?(:clj
+   (def ^:private ^ThreadLocal md-pool
+     (ThreadLocal/withInitial
+      (reify Supplier (get [_] (IdentityHashMap.))))))
+
+#?(:clj
+   (defn ^MessageDigest borrow-md
+     "Return a reset MessageDigest produced by `md-create-fn`, reusing a
+      previously released one for this thread+factory when available."
+     [md-create-fn]
+     (let [^IdentityHashMap m (.get md-pool)
+           ^ArrayDeque dq (or (.get m md-create-fn)
+                              (let [d (ArrayDeque.)] (.put m md-create-fn d) d))
+           md (.pollFirst dq)]
+       (if (nil? md) (md-create-fn) md))))
+
+#?(:clj
+   (defn release-md
+     "Return a just-digested (hence reset) MessageDigest to the free-list."
+     [md-create-fn ^MessageDigest md]
+     (let [^IdentityHashMap m (.get md-pool)
+           ^ArrayDeque dq (.get m md-create-fn)]
+       (.addFirst dq md)
+       nil)))
+
+#?(:cljs
+   (do
+     (defn borrow-md [md-create-fn] (md-create-fn))
+     (defn release-md [_md-create-fn _md] nil)))
+
 (defn ^bytes digest
   [bytes-or-seq-of-bytes md-create-fn]
-  (let [^MessageDigest md (md-create-fn)]
+  (let [^MessageDigest md (borrow-md md-create-fn)]
     (if (seq? bytes-or-seq-of-bytes)
       (doseq [^bytes bs bytes-or-seq-of-bytes]
         (.update md bs))
       (.update md  ^bytes bytes-or-seq-of-bytes))
-    (.digest md)))
+    (let [out (.digest md)]
+      (release-md md-create-fn md)
+      out)))
 
 (defn ^bytes coerce-seq [seq md-create-fn write-handlers]
-  (let [^MessageDigest seq-md (md-create-fn)]
+  (let [^MessageDigest seq-md (borrow-md md-create-fn)]
     (loop [s seq]
       (let [[f & r] s]
         (.update seq-md  ^bytes (-coerce f md-create-fn write-handlers))
         (when-not (empty? r)
           (recur (rest s)))))
-    (.digest seq-md)))
+    (let [out (.digest seq-md)]
+      (release-md md-create-fn seq-md)
+      out)))
 
 (defn ^bytes xor-hashes
   "Commutatively coerces elements of collection, seq entries must already be crypto hashes

@@ -1,7 +1,11 @@
-# hasch allocation analysis & reduction (`perf/reduce-allocations`)
+# hasch allocation analysis & reduction (`perf/reduce-allocations-md-pool`)
 
 **Baseline:** hasch `0.3.94` (tag `0.3.94`, commit `d9efe49`) + incognito `0.3.66`.
-**Branch:** `perf/reduce-allocations` (forked from `0.3.94`).
+**Branch:** `perf/reduce-allocations-md-pool` — the `perf/reduce-allocations`
+change set (C1, C3–C8) **plus** the C2 thread-local `MessageDigest` pool re-added
+on top. If you want the pool-free variant (no thread-local state, `md-create-fn`
+invoked once per digest), use `perf/reduce-allocations` instead; this branch trades
+that for a further −54…66 % allocation cut on every digest-heavy shape.
 **Scope:** JVM hot path (`platform.clj` + `benc.cljc`). All changes keep the hash
 output **bit-identical** to 0.3.94 — verified by a pinned-hash corpus, the existing
 `api_test`, and the datahike integration test (see [Hash identity](#hash-identity)).
@@ -64,28 +68,28 @@ CodeableConcept = 10, Observation ≈ 13.**
 (what direct callers do). Harness: warmup + `System/gc`, then N iterations timed with
 `System/nanoTime` and allocation via `com.sun.management.ThreadMXBean`.
 
-Final numbers with all shipped changes (C1, C3–C8; the C2 pool was prototyped,
-measured, and **dropped by decision** — see C2 below):
+Final numbers with **all changes incl. the C2 pool** (this branch):
 
 | Case | Baseline B/op | Optimized B/op | **Δ alloc** | Baseline ns | Optimized ns | Δ time |
 |------|--------------:|---------------:|:-----------:|------------:|-------------:|:------:|
-| **uuid Coding** | 14,264 | 2,504 | **−82 %** | 4,319 | 1,198 | −72 % |
-| **uuid CodeableConcept** | 23,488 | 6,776 | **−71 %** | 6,963 | 2,866 | −59 % |
-| **uuid Observation** | 30,680 | 9,864 | **−68 %** | 9,291 | 4,134 | −56 % |
-| **uuid cc-batch (20×CC)** | 301,744 | 128,248 | **−57 %** | 90,735 | 51,565 | −43 % |
-| **uuid bigmap (200 entries)** | 346,912 | 130,200 | **−62 %** | 104,080 | 62,191 | −40 % |
-| **uuid entity (card-many sets)** | 24,640 | 8,808 | **−64 %** | 8,061 | 3,654 | −55 % |
-| **uuid bigset (200 elems)** | 198,176 | 117,456 | **−41 %** | 77,392 | 52,168 | −33 % |
-| **b64-hash Coding** | 14,560 | 2,800 | **−81 %** | 4,385 | 1,110 | −75 % |
-| **b64-hash CodeableConcept** | 23,688 | 6,976 | **−71 %** | 6,995 | 2,878 | −59 % |
-| edn-hash Coding (realized) | 14,152 | 11,112 | −21 % | 3,702 | 2,979 | −20 % |
-| edn-hash CodeableConcept (realized) | 23,376 | 15,144 | −35 % | 6,456 | 4,660 | −28 % |
+| **uuid Coding** | 14,264 | 1,064 | **−93 %** | 4,319 | 1,049 | −76 % |
+| **uuid CodeableConcept** | 23,488 | 2,936 | **−88 %** | 6,963 | 2,625 | −62 % |
+| **uuid Observation** | 30,680 | 4,104 | **−87 %** | 9,291 | 4,054 | −56 % |
+| **uuid cc-batch (20×CC)** | 301,744 | 58,360 | **−81 %** | 90,735 | 46,175 | −49 % |
+| **uuid bigmap (200 entries)** | 346,912 | 59,416 | **−83 %** | 104,080 | 59,046 | −43 % |
+| **uuid entity (card-many sets)** | 24,640 | 3,432 | **−86 %** | 8,061 | 3,370 | −58 % |
+| **uuid bigset (200 elems)** | 198,176 | 40,272 | **−80 %** | 77,392 | 41,610 | −46 % |
+| **b64-hash Coding** | 14,560 | 1,264 | **−91 %** | 4,385 | 966 | −78 % |
+| **b64-hash CodeableConcept** | 23,688 | 3,136 | **−87 %** | 6,995 | 2,604 | −63 % |
+| edn-hash Coding (realized) | 14,152 | 9,672 | −32 % | 3,702 | 2,957 | −20 % |
+| edn-hash CodeableConcept (realized) | 23,376 | 11,304 | −52 % | 6,456 | 4,746 | −26 % |
+
+For the **pool-free** column (branch `perf/reduce-allocations`), see the C2
+ablation below — its "shipped (no pool)" column is that branch's headline.
 
 "entity" is a Datomic-style entity map with three cardinality-many SET values —
 sets have no intrinsic order in Datomic, so this shape hits the set branch on
-every entity hash. Intermediate per-change numbers in the sections below were
-mostly measured on pool-inclusive builds and are noted as such where they
-differ.
+every entity hash.
 
 The `uuid` path benefits from *all* changes (incl. the lazy-seq bypass); the direct
 `edn-hash` path keeps its public unsigned-seq return, so it only gets the
@@ -110,23 +114,28 @@ consumes it directly through the `ByteBuffer`. `uuid` uses this fast path.
 `edn-hash` and `uuid5` keep their exact public behaviour (`uuid5` still accepts the
 unsigned seq — `api_test` relies on that). **Saves hotspot #1 + #5 on the uuid path.**
 
-### C2 — Thread-local `MessageDigest` free-list — **prototyped, measured, DROPPED**
+### C2 — Thread-local `MessageDigest` free-list (`benc/borrow-md` / `release-md`)
+**On this branch (`perf/reduce-allocations-md-pool`) the pool is included.** On
+the sibling `perf/reduce-allocations` it is not — that is the only difference
+between the two branches.
+
 `MessageDigest.digest()` leaves the instance reset, so it is immediately
-reusable. The prototype had `digest`/`coerce-seq`/`map-entry-digest` borrow from
-a per-thread free-list (`ThreadLocal<IdentityHashMap<factory, ArrayDeque>>`)
-and return instances after `.digest`. It was verified safe (0 mismatches across
-~1.18M concurrent `uuid` computations on 16 threads; nested digests each borrow
-a distinct instance; exception → instance dropped; keyed by `md-create-fn`
-identity so SHA-512/MD5 never mix) and bit-identical. **It was dropped by
-decision** to keep the branch free of thread-local state and to keep
-`md-create-fn` invoked exactly once per digest — hotspot #2 therefore remains
-in the shipped branch, at one fresh `MessageDigest` per collection/entry.
+reusable. `digest`, `coerce-seq` and `map-entry-digest` borrow from a per-thread
+free-list (`ThreadLocal<IdentityHashMap<factory, ArrayDeque>>`) and return the
+instance after `.digest`. Nested digests are live simultaneously (e.g. a vector's
+seq-md while its elements hash) but each borrows a *distinct* instance and only
+returns it AFTER its `.digest`, so no instance is ever aliased across two live
+computations. On exception an instance is simply dropped (pool shrinks;
+correctness unaffected). Keyed by `md-create-fn` identity so the default SHA-512
+and a caller's MD5 never mix. ClojureScript has no threads → `borrow-md` = the
+factory, `release-md` = no-op (behaviour identical to the original code).
+**Removes ~all of hotspot #2** (verified: 0 mismatches across ~0.9–1.18M
+concurrent `uuid` computations on 16 threads).
 
-**Ablation — what the pool would add on top of the shipped branch** (kept on
-record as the obvious next lever if transactor GC pressure needs another turn;
-the full implementation is preserved on the `archive/perf-with-md-pool` branch):
+**What the pool is worth** on top of the pool-free branch (both bit-identical;
+allocation is deterministic, timing has JIT noise):
 
-| `uuid` case | shipped (no pool) | with pool | pool's further B/op cut | pool's time cut |
+| `uuid` case | pool-free branch | this branch (pool) | pool's further B/op cut | pool's time cut |
 |---|--:|--:|:--:|:--:|
 | Coding | 2,600 B / 999 ns | 1,064 B / 1,049 ns | −59 % | ≈0 |
 | CodeableConcept | 6,776 B / 2,979 ns | 2,936 B / 2,625 ns | −57 % | −12 % |
@@ -138,11 +147,12 @@ the full implementation is preserved on the `archive/perf-with-md-pool` branch):
 With the pool, allocations drop a further 2.2–2.9× — a SUN SHA-512
 `MessageDigest` is ~400–600 B of internal state, and the fused map/set paths
 create one per entry/element, so per-entry MD allocation (plus the synchronized
-`getInstance` provider lookup, ~40 ns) is the dominant remaining cost in the
-shipped branch. Pool trade-offs if revisited: per-thread retention bounded by
-max value nesting (single-digit KB); semantic surface is that `md-create-fn`
-gets invoked fewer times (any factory returning a standard `MessageDigest` is
-unaffected — `.digest` resets the instance, which is the documented contract).
+`getInstance` provider lookup, ~40 ns) is the dominant remaining cost without it.
+Trade-offs this branch accepts: per-thread retention bounded by max value nesting
+(single-digit KB); `md-create-fn` is invoked fewer times (any factory returning a
+standard `MessageDigest` is unaffected — `.digest` resets the instance, which is
+the documented contract; only a factory used as a per-call side-effect channel,
+e.g. a spy/counter, would observe the difference).
 
 ### C3 — `encode` without `ByteArrayOutputStream` (`platform/encode`)
 Prepend the magic byte in one allocation: `byte-array(1+len)`, set `[0]=magic`,
@@ -255,7 +265,7 @@ digest) hashes for maps/sets — all pinned from unmodified 0.3.94.
 | `clojure -M:test` (unit + integration incl. datahike) | **16 tests, 121 assertions, 0 failures** |
 | `shadow-cljs compile node-test` + `hasch.api-test` (cljs) | **0 warnings; 8 tests, 27 assertions, 0 failures** |
 | `clojure -M:format` (cljfmt) | clean |
-| Concurrency stress (16 threads, ~0.6–1.2M `uuid` per run, after each change set incl. final no-pool build) | **0 mismatches** |
+| Concurrency stress (16 threads, ~0.9–1.2M `uuid` per run; critical for the thread-local pool) | **0 mismatches** |
 
 `tests.edn` now also defines a `:unit` suite (was integration-only) so
 `clojure -M:test` exercises the unit tests including the new pins.
@@ -285,13 +295,10 @@ upstream discussion:
 
 ## 6. Further safe wins not yet taken
 
-- **The C2 MessageDigest pool** — measured, bit-identical, and dropped by
-  decision (see C2). Reinstating it is the single biggest remaining lever:
-  a further −54…66 % B/op on every digest-heavy shape.
-- **`clone()` a template MessageDigest** instead of `getInstance` per digest —
-  `clone` (13 ns) vs `getInstance` (42 ns) and no provider lookup; a milder,
-  stateless alternative to the pool that would need the same
-  `md-create-fn`-keyed template cache.
+- **`clone()` a template MessageDigest** instead of `getInstance` on a pool miss
+  (or as a pool-free alternative altogether) — `clone` (13 ns) vs `getInstance`
+  (42 ns) and no provider lookup. Would need the same `md-create-fn`-keyed
+  template cache; a stateless-per-call variant of C2.
 - **Replace the poisoned `^bytes` defn tags** on `digest`/`coerce-seq`/`encode`/
   `encode-safe` with `^"[B"` string tags (which `def` evaluates to themselves).
   Purely defensive — see the compiler gotcha under C8.

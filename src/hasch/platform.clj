@@ -5,7 +5,8 @@
             [clojure.java.io :as io]
             [incognito.base :as ib]
             [hasch.benc :refer [magics PHashCoercion -coerce
-                                digest coerce-seq xor-hashes encode-safe]])
+                                digest coerce-seq xor-hashes encode-safe
+                                borrow-md release-md]])
   (:import java.io.ByteArrayOutputStream
            java.nio.ByteBuffer
            java.nio.charset.StandardCharsets
@@ -97,10 +98,12 @@ Our hash version is coded in first 2 bits."
   "digest of (-coerce k) ++ (-coerce v): the same bytes `coerce-seq` produces
    for the entry viewed as the vector [k v], without allocating the entry."
   [k v md-create-fn write-handlers]
-  (let [^MessageDigest md (md-create-fn)]
+  (let [^MessageDigest md (borrow-md md-create-fn)]
     (.update md ^bytes (-coerce k md-create-fn write-handlers))
     (.update md ^bytes (-coerce v md-create-fn write-handlers))
-    (.digest md)))
+    (let [out (.digest md)]
+      (release-md md-create-fn md)
+      out)))
 
 (defn- new-acc
   "XOR accumulator sized like xor-hashes' min(count(first-hash), 32), where the
